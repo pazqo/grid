@@ -171,11 +171,13 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
               {{- end }}
           {{- end }}
           {{- end }}
+          {{- if $cfg.backends }}
           - filter: load_balancer
             clusters:
               {{- range $i, $backend := $cfg.backends }}
               {{- include "praxis-gateway.backendCluster" (dict "root" $ "i" $i "b" $backend) | trim | nindent 14 }}
               {{- end }}
+          {{- end }}
   {{- if $apiKey }}
   policy.yaml: |
     engine_settings:
