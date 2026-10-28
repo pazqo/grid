@@ -54,23 +54,30 @@ static PASS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// `refresh_signals` call and released before the poll window, so other tests can run their own
 /// signals passes between attempts.
 async fn signals_pass(api: &FakeApi, path: &str) {
-    for _attempt in 0..50 {
-        {
-            let _pass = PASS.lock().await;
-            let client = api.client("default");
-            let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
-            grid_network::refresh_signals(&ctx, &client, NETWORK)
-                .await
-                .expect("signals pass succeeds");
-        }
-        for _poll in 0..10 {
-            if fixtures::observe(api, path).condition("Ready").is_some() {
-                return;
+    let publish = async {
+        loop {
+            {
+                let _pass = PASS.lock().await;
+                let client = api.client("default");
+                let ctx = OperatorCtx::new(client.clone(), None, SignalMode::Poll);
+                grid_network::refresh_signals(&ctx, &client, NETWORK)
+                    .await
+                    .expect("signals pass succeeds");
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            for _poll in 0..10 {
+                if fixtures::observe(api, path).condition("Ready").is_some() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(30), publish)
+        .await
+        .is_err()
+    {
+        panic!("{path} never held a Ready condition within 30 s");
     }
-    panic!("{path} never held a Ready condition within 30 s");
 }
 
 /// The field manager each provider condition type belongs to.
