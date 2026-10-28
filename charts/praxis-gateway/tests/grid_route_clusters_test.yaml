@@ -66,8 +66,8 @@ tests:
           path: data["praxis.yaml"]
           pattern: 'clusters:\n\s+- "grid-local-a"\n\s+- "grid-remote-e"'
 
-  - it: fails render mode without backends
-    template: templates/deployment.yaml
+  - it: emits an empty clusters list when backends is empty with gridServing
+    template: templates/gateway-config.yaml
     set:
       image.flavor: grid-gateway
       grid.siteName: dagobah
@@ -77,6 +77,22 @@ tests:
       praxisConfig.render.auth.mode: none
       praxisConfig.render.gridServing.enabled: true
       praxisConfig.render.gridServing.networkName: grid
+      praxisConfig.render.backends: []
+    asserts:
+      - matchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'filter: grid_site_route\n\s+model_header: X-Gateway-Model-Name\n\s+clusters: \[\]'
+
+  - it: fails render mode without backends when gridServing is disabled
+    template: templates/deployment.yaml
+    set:
+      image.flavor: grid-gateway
+      grid.siteName: dagobah
+      gridIdentity.tlsSecretName: grid-site-identity
+      gridIdentity.caSecretName: grid-ca
+      praxisConfig.source: render
+      praxisConfig.render.auth.mode: none
+      praxisConfig.render.model: gpt-4
       praxisConfig.render.backends: []
     asserts:
       - failedTemplate:

@@ -144,12 +144,13 @@ The data of the chart-rendered gateway ConfigMap, also hashed into checksum/conf
           {{- if ($.Values.praxisConfig.render.gridServing).enabled }}
           - filter: grid_site_route
             model_header: X-Gateway-Model-Name
-            {{- with $cfg.backends }}
             clusters:
-              {{- range . }}
+              {{- if $cfg.backends }}
+              {{- range $cfg.backends }}
               - {{ .cluster | quote }}
               {{- end }}
-            {{- end }}
+              {{- else }} []
+              {{- end }}
             {{- with ($.Values.praxisConfig.render.gridServing).siteRoute }}
             {{- with .availability }}
             availability:
