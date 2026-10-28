@@ -1411,16 +1411,8 @@ fn apply_tls_secret(
 }
 
 /// Generate a random 32-byte hex provider credential.
-fn generate_provider_credential() -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("openssl").args(["rand", "-hex", "32"]).output()?;
-    if !output.status.success() {
-        return Err("openssl failed to generate provider credential".into());
-    }
-    let token = String::from_utf8(output.stdout)?.trim().to_owned();
-    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("openssl returned an invalid provider credential".into());
-    }
-    Ok(token)
+fn generate_provider_credential() -> String {
+    certs::generate_provider_credential()
 }
 
 /// Create an Opaque Secret with a `token` key.
@@ -2534,7 +2526,7 @@ fn deploy_setup(context: &ProviderTrafficContext) -> Result<OverlayState, Box<dy
 
     for cluster in CLUSTERS {
         let ctx = cluster_context(cluster);
-        let credential = generate_provider_credential()?;
+        let credential = generate_provider_credential();
         apply_credential_secret(&ctx, VCR_INFERENCE_CREDENTIAL, &credential)?;
         eprintln!("  [OK] {cluster}: vcr-inference-credential created");
         apply_stack(cluster, "vcr-backend")?;

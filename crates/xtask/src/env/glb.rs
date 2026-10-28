@@ -42,7 +42,7 @@ const CLUSTER_NAMES: &[&str] = &[
 const GRID_CLUSTERS: &[&str] = &["east-edge", "east-provider", "west-edge", "west-provider"];
 
 /// Required CLI tools (checked during prerequisites).
-const REQUIRED_TOOLS: &[&str] = &["kind", "kubectl", "curl", "docker", "openssl"];
+const REQUIRED_TOOLS: &[&str] = &["kind", "kubectl", "curl", "docker"];
 
 /// Provider-role clusters that advertise a gateway address.
 const PROVIDER_CLUSTERS: &[&str] = &["east-provider", "west-provider"];
@@ -249,12 +249,12 @@ pub(crate) fn install_provider_boundary_with_mode_and_external(
         apply_gtm_tls_secret(forge_state_dir)?;
     }
     for provider in PROVIDER_CLUSTERS {
-        let provider_credential = generate_provider_credential()?;
+        let provider_credential = generate_provider_credential();
         apply_provider_config(provider, forge_state_dir)?;
         apply_provider_tls_secret(provider)?;
         apply_provider_credential_secret(provider, &provider_credential)?;
         if *provider == "east-provider" {
-            let secondary_credential = generate_provider_credential()?;
+            let secondary_credential = generate_provider_credential();
             apply_named_provider_credential_secret(
                 provider,
                 SECONDARY_PROVIDER_CREDENTIAL_SECRET,
@@ -941,16 +941,8 @@ fn apply_provider_tls_secret(provider: &str) -> Result<(), Box<dyn std::error::E
 }
 
 /// Generate a fresh non-production provider credential.
-fn generate_provider_credential() -> Result<String, Box<dyn std::error::Error>> {
-    let output = Command::new("openssl").args(["rand", "-hex", "32"]).output()?;
-    if !output.status.success() {
-        return Err("openssl failed to generate provider credential".into());
-    }
-    let token = String::from_utf8(output.stdout)?.trim().to_owned();
-    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("openssl returned an invalid provider credential".into());
-    }
-    Ok(token)
+fn generate_provider_credential() -> String {
+    certs::generate_provider_credential()
 }
 
 /// Apply the provider-local credential consumed only on the backend hop.
