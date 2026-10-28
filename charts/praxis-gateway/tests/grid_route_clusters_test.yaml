@@ -82,6 +82,9 @@ tests:
       - matchRegex:
           path: data["praxis.yaml"]
           pattern: 'filter: grid_site_route\n\s+model_header: X-Gateway-Model-Name\n\s+clusters: \[\]'
+      - notMatchRegex:
+          path: data["praxis.yaml"]
+          pattern: 'filter: load_balancer'
 
   - it: fails render mode without backends when gridServing is disabled
     template: templates/deployment.yaml
