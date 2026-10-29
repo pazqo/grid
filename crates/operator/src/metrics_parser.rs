@@ -667,7 +667,10 @@ test_kv_cache{model="llama"} 0.3
             healthy: Some(0.0),
             ..Default::default()
         };
-        assert!(!partial.into_backend_metrics().healthy, "zero health gauge -> unhealthy");
+        assert!(
+            !partial.into_backend_metrics().healthy,
+            "zero health gauge -> unhealthy"
+        );
     }
 
     #[test]

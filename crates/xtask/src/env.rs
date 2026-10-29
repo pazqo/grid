@@ -1520,8 +1520,8 @@ fn env_verify_gateway_e2e(config: &Path) -> Result<(), Box<dyn std::error::Error
 /// 3. Run the Grid operator to generate an overlay with both local and `api_provider` candidates.
 /// 4. Deploy the consumer gateway with a plain-HTTP cluster for the API-provider mock in addition to the standard mTLS
 ///    clusters for local providers.
-/// 5. Verify: `model-x` -> local provider gateway (HTTP 200), `model-z` -> mock API-provider (HTTP 200), unknown model ->
-///    404.
+/// 5. Verify: `model-x` -> local provider gateway (HTTP 200), `model-z` -> mock API-provider (HTTP 200), unknown model
+///    -> 404.
 fn env_verify_api_fallback(config: &Path, site: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use operator::{
         API_FALLBACK_MODEL, API_PROVIDER_SECRET_KEY, API_PROVIDER_SECRET_NAME, API_PROVIDER_SECRET_NS,

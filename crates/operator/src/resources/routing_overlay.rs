@@ -4411,7 +4411,11 @@ mod tests {
         let net = "a".repeat(50);
         let gw = "b".repeat(50);
         let name = overlay_configmap_name(&net, &gw);
-        assert!(name.len() <= MAX_K8S_NAME, "name must be <=63 chars, got {}", name.len());
+        assert!(
+            name.len() <= MAX_K8S_NAME,
+            "name must be <=63 chars, got {}",
+            name.len()
+        );
     }
 
     #[test]
