@@ -282,6 +282,9 @@ fn validate_candidates_with_empty(
         validate_name(&format!("candidates[{index}].cluster"), &cand.cluster)?;
         validate_header_value(&format!("candidates[{index}].cluster"), &cand.cluster)?;
         validate_credential(index, cand.credential.as_ref())?;
+        if cand.weight == Some(0) {
+            return Err(format!("grid: candidates[{index}].weight must not be zero").into());
+        }
 
         if !seen.insert((cand.kind, cand.name.clone(), cand.site.clone(), cand.cluster.clone())) {
             return Err(format!(
@@ -637,5 +640,18 @@ mod tests {
         let base = r#""kind":"inference_model","name":"m","site":"s","cluster":"c""#;
         assert!(parse(&format!("{{{base}}}")).unwrap());
         assert!(!parse(&format!(r#"{{{base},"publishes_load":false}}"#)).unwrap());
+    }
+
+    #[test]
+    fn zero_weight_is_rejected() {
+        let raw = vec![CandidateConfig {
+            weight: Some(0),
+            ..candidate("inference_model", "m", "s", "c")
+        }];
+        let err = validate_candidates(raw).expect_err("zero weight must be rejected");
+        assert!(
+            err.to_string().contains("weight must not be zero"),
+            "unexpected error: {err}"
+        );
     }
 }

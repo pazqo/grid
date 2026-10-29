@@ -260,7 +260,8 @@ pub(crate) struct ServingCandidate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential: Option<ProjectedCredential>,
     /// Declared capacity weight from the provider's `capacityWeight`, carried from the overlay's
-    /// `traffic_weight`. Omitted when absent, so older gateways default to 1.
+    /// `traffic_weight`. Omitted when absent; a gateway that predates this field rejects the config
+    /// via `deny_unknown_fields`, so the gateway must accept the field before the operator emits it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) weight: Option<u32>,
 }
@@ -1319,6 +1320,18 @@ mod tests {
             config.candidates[0].weight,
             Some(3),
             "traffic_weight must flow to the gateway's weight field"
+        );
+        let json = to_text(&config).expect("json");
+        assert!(json.contains("\"weight\": 3"), "weight serializes into the config JSON");
+    }
+
+    #[test]
+    fn absent_weight_is_omitted_from_json() {
+        let config = render(&two_site(), &INPUTS);
+        let json = to_text(&config).expect("json");
+        assert!(
+            !json.contains("\"weight\""),
+            "absent weight must not appear in JSON so older gateways with deny_unknown_fields accept it"
         );
     }
 
