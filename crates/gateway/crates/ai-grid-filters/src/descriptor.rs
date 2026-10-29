@@ -131,6 +131,10 @@ pub struct CandidateConfig {
     /// gateways. Older/static configs may omit it and retain the derived ID.
     #[serde(default)]
     pub stable_id: Option<String>,
+
+    /// Declared capacity weight from the provider's `capacityWeight` CRD field.
+    #[serde(default)]
+    pub weight: Option<u32>,
 }
 
 /// Default freshness state for candidates.
@@ -217,6 +221,9 @@ pub struct RouteCandidate {
     /// The upstream the gateway built for this cluster from the serving config, sent to
     /// directly instead of a `load_balancer` cluster.
     pub dial: Option<Arc<Dialed>>,
+
+    /// Declared capacity weight from the provider CRD, defaulting to 1.
+    pub weight: u32,
 }
 
 impl RouteCandidate {
@@ -314,6 +321,7 @@ fn validate_candidates_with_empty(
             site: Arc::from(cand.site.as_str()),
             stable_id,
             dial: None,
+            weight: cand.weight.unwrap_or(1),
         });
     }
 
@@ -460,6 +468,7 @@ mod tests {
             publishes_load: true,
             site: site.to_owned(),
             stable_id: None,
+            weight: None,
         }
     }
 
