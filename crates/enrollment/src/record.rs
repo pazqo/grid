@@ -135,6 +135,25 @@ impl RecordError {
     }
 }
 
+/// Tracks which steps of a [`Recorder::record`] call succeeded, so the
+/// timeout path in [`Recorder::spawn`] can decide whether cleanup is safe.
+pub struct RecordProgress {
+    /// Set after the CSR is created on the API server.
+    created: std::sync::atomic::AtomicBool,
+    /// Set after the completion patch lands.
+    completed: std::sync::atomic::AtomicBool,
+}
+
+impl RecordProgress {
+    /// Fresh progress with no steps completed.
+    fn new() -> Self {
+        Self {
+            created: std::sync::atomic::AtomicBool::new(false),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
 /// Writes enrollment records to the API server and tracks outstanding tasks
 /// so the shutdown drain can wait for them.
 pub struct Recorder {
@@ -145,7 +164,7 @@ pub struct Recorder {
     /// The signer name records are filed under.
     signer_name: String,
     /// Outstanding recording tasks the shutdown drain joins.
-    handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl std::fmt::Debug for Recorder {
@@ -164,7 +183,7 @@ impl Recorder {
             requests: Api::all(client.clone()),
             reviews: Api::all(client),
             signer_name,
-            handles: std::sync::Mutex::new(Vec::new()),
+            tasks: std::sync::Mutex::new(tokio::task::JoinSet::new()),
         }
     }
 
@@ -230,27 +249,23 @@ impl Recorder {
     /// Create the request, approve it, and complete it with the issued certificate.
     /// Returns the record's name.
     ///
-    /// Completion is retried on failure. If retries are exhausted, the
-    /// approved-but-incomplete record is deleted so it does not linger on
-    /// clusters whose CSR cleaner does not collect that state.
+    /// Completion is retried on transient (non-API) failure. If retries are
+    /// exhausted, the approved-but-incomplete record is deleted so it does not
+    /// linger on clusters whose CSR cleaner does not collect that state.
     ///
-    /// `created` is set to `true` once the CSR exists on the API server, so
-    /// the caller knows whether cleanup is safe after a timeout.
+    /// `progress` tracks which steps succeeded so the caller can decide
+    /// whether cleanup is safe after a timeout.
     ///
     /// # Errors
     ///
-    /// Returns which call failed. A record that could not be completed is
-    /// cleaned up; a record that could not be created or approved is left for
-    /// the API server's pending-CSR cleaner.
-    pub async fn record(
-        &self,
-        record: &Record,
-        created: &std::sync::atomic::AtomicBool,
-    ) -> Result<String, RecordError> {
+    /// Returns which call failed. A record whose completion failed is cleaned
+    /// up here. The timeout path in [`spawn`](Self::spawn) handles cleanup
+    /// when the deadline fires mid-flight.
+    pub async fn record(&self, record: &Record, progress: &RecordProgress) -> Result<String, RecordError> {
         let name = record_name(&record.site, record.enrollment_id);
         // Boxed: each kube call builds a large future, kept off this frame.
         Box::pin(self.create(&name, record)).await?;
-        created.store(true, std::sync::atomic::Ordering::Release);
+        progress.created.store(true, std::sync::atomic::Ordering::Release);
         Box::pin(self.approve(&name)).await?;
 
         let mut result = Box::pin(self.complete(&name, &record.cert_pem)).await;
@@ -258,14 +273,29 @@ impl Recorder {
             if result.is_ok() {
                 break;
             }
+            if !Self::is_transient(&result) {
+                break;
+            }
             tokio::time::sleep(RETRY_DELAY).await;
             result = Box::pin(self.complete(&name, &record.cert_pem)).await;
         }
 
-        if result.is_err() {
+        if result.is_ok() {
+            progress.completed.store(true, std::sync::atomic::Ordering::Release);
+        } else {
             Box::pin(self.cleanup(&name)).await;
         }
         result.map(|()| name)
+    }
+
+    /// Whether a completion error is worth retrying (network or server error,
+    /// not a 4xx refusal).
+    fn is_transient(result: &Result<(), RecordError>) -> bool {
+        matches!(
+            result,
+            Err(RecordError::Complete { source, .. })
+                if !matches!(source, kube::Error::Api(response) if response.code < 500)
+        )
     }
 
     /// Create the request. A name already taken is refused, not adopted: nothing
@@ -346,21 +376,25 @@ impl Recorder {
     /// the same name is never deleted.
     pub fn spawn(self: &Arc<Self>, record: Record) {
         let recorder = Arc::clone(self);
-        let handle = tokio::spawn(async move {
+        let mut guard = self.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.spawn(async move {
             let name = record_name(&record.site, record.enrollment_id);
-            let created = std::sync::atomic::AtomicBool::new(false);
-            let outcome = match tokio::time::timeout(RECORD_DEADLINE, recorder.record(&record, &created)).await {
-                Ok(outcome) => outcome,
-                Err(_elapsed) => {
-                    if created.load(std::sync::atomic::Ordering::Acquire) {
-                        Self::bounded_cleanup(&recorder, &name).await;
-                    }
-                    Err(RecordError::Deadline {
-                        name,
-                        deadline: RECORD_DEADLINE,
-                    })
-                },
-            };
+            let progress = RecordProgress::new();
+            let outcome =
+                match tokio::time::timeout(RECORD_DEADLINE, recorder.record(&record, &progress)).await {
+                    Ok(outcome) => outcome,
+                    Err(_elapsed) => {
+                        if progress.created.load(std::sync::atomic::Ordering::Acquire)
+                            && !progress.completed.load(std::sync::atomic::Ordering::Acquire)
+                        {
+                            Self::bounded_cleanup(&recorder, &name).await;
+                        }
+                        Err(RecordError::Deadline {
+                            name,
+                            deadline: RECORD_DEADLINE,
+                        })
+                    },
+                };
             match outcome {
                 Ok(written) => {
                     tracing::info!(enrollment_id = %record.enrollment_id, record = %written, "enrollment recorded");
@@ -370,9 +404,6 @@ impl Recorder {
                 },
             }
         });
-        let mut guard = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.retain(|task| !task.is_finished());
-        guard.push(handle);
     }
 
     /// Wait for every outstanding recording task to finish.
@@ -380,17 +411,15 @@ impl Recorder {
     /// Called once after the server stops accepting requests, so no new tasks
     /// are spawned while draining.
     pub async fn drain(&self) {
-        let handles = {
-            let mut guard = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut tasks = {
+            let mut guard = self.tasks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::take(&mut *guard)
         };
-        if handles.is_empty() {
+        if tasks.is_empty() {
             return;
         }
-        tracing::info!(outstanding = handles.len(), "waiting for recording tasks");
-        for handle in handles {
-            drop(handle.await);
-        }
+        tracing::info!(outstanding = tasks.len(), "waiting for recording tasks");
+        while tasks.join_next().await.is_some() {}
     }
 }
 
@@ -478,8 +507,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        APPROVED_REASON, COMPLETION_RETRIES, DEFAULT_SIGNER_NAME, Record, RecordError, Recorder, SITE_LABEL,
-        approval_patch, build, canonical_request, certificate_patch, record_name,
+        APPROVED_REASON, COMPLETION_RETRIES, DEFAULT_SIGNER_NAME, Record, RecordError, RecordProgress, Recorder,
+        SITE_LABEL, approval_patch, build, canonical_request, certificate_patch, record_name,
     };
 
     const ID: Uuid = Uuid::from_u128(0x9F86_D081_884C_7D65_9A2F_EAA0_C55A_D015);
@@ -633,7 +662,7 @@ mod tests {
         let (client, seen) = fake_server(|_method, _path, _count| (200, CREATED));
         let recorder = Recorder::new(client, DEFAULT_SIGNER_NAME.to_owned());
         let name = recorder
-            .record(&record(), &std::sync::atomic::AtomicBool::new(false))
+            .record(&record(), &RecordProgress::new())
             .await
             .expect("recorded");
         let calls: Vec<Seen> = seen.lock().expect("log").clone();
@@ -671,7 +700,7 @@ mod tests {
         });
         let recorder = Recorder::new(client, DEFAULT_SIGNER_NAME.to_owned());
         let error = recorder
-            .record(&record(), &std::sync::atomic::AtomicBool::new(false))
+            .record(&record(), &RecordProgress::new())
             .await
             .expect_err("the name is taken");
         assert_eq!(seen.lock().expect("log").len(), 1, "nothing is adopted");
@@ -694,7 +723,7 @@ mod tests {
         });
         let recorder = Recorder::new(client, DEFAULT_SIGNER_NAME.to_owned());
         let error = recorder
-            .record(&record(), &std::sync::atomic::AtomicBool::new(false))
+            .record(&record(), &RecordProgress::new())
             .await
             .expect_err("approval is refused");
         assert!(
@@ -714,7 +743,7 @@ mod tests {
         });
         let recorder = Recorder::new(client, DEFAULT_SIGNER_NAME.to_owned());
         let name = recorder
-            .record(&record(), &std::sync::atomic::AtomicBool::new(false))
+            .record(&record(), &RecordProgress::new())
             .await
             .expect("retried completion succeeds");
         let calls: Vec<Seen> = seen.lock().expect("log").clone();
@@ -735,7 +764,7 @@ mod tests {
         });
         let recorder = Recorder::new(client, DEFAULT_SIGNER_NAME.to_owned());
         let error = recorder
-            .record(&record(), &std::sync::atomic::AtomicBool::new(false))
+            .record(&record(), &RecordProgress::new())
             .await
             .expect_err("completion always fails");
         assert!(matches!(&error, RecordError::Complete { .. }), "{error}");

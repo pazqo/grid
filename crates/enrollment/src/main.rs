@@ -513,11 +513,17 @@ async fn load_recorder(authorizer: &Authorizer) -> Result<Option<Arc<enrollment:
 }
 
 /// Wait for outstanding recording tasks so a shutdown between CSR calls does
-/// not leave a partial record on the hub.
+/// not leave a partial record on the hub. Bounded so the request drain plus
+/// a slow record stays inside the default thirty-second grace period.
 #[cfg(feature = "csr-record")]
 async fn drain_records(recorder: Option<Arc<enrollment::record::Recorder>>) {
     if let Some(recorder) = &recorder {
-        recorder.drain().await;
+        if tokio::time::timeout(Duration::from_secs(4), recorder.drain())
+            .await
+            .is_err()
+        {
+            tracing::warn!("recording tasks still running at shutdown");
+        }
     }
 }
 
