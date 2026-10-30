@@ -464,7 +464,7 @@ fn dedup<'overlay>(
         match (folded.weight, candidate.traffic_weight) {
             (None, w) => folded.weight = w,
             (Some(existing), Some(new)) if new > existing => folded.weight = Some(new),
-            _ => {}
+            _ => {},
         }
     }
     unique
