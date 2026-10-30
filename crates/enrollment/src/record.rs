@@ -316,15 +316,22 @@ impl Recorder {
 
     /// Write `record` off the request path, within the deadline, and log the
     /// outcome. The task is tracked so [`drain`](Self::drain) can wait for it.
+    ///
+    /// Cleanup runs outside the deadline so that a timed-out completion still
+    /// deletes the approved-but-incomplete record.
     pub fn spawn(self: &Arc<Self>, record: Record) {
         let recorder = Arc::clone(self);
         let handle = tokio::spawn(async move {
+            let name = record_name(&record.site, record.enrollment_id);
             let outcome = match tokio::time::timeout(RECORD_DEADLINE, recorder.record(&record)).await {
                 Ok(outcome) => outcome,
-                Err(_elapsed) => Err(RecordError::Deadline {
-                    name: record_name(&record.site, record.enrollment_id),
-                    deadline: RECORD_DEADLINE,
-                }),
+                Err(_elapsed) => {
+                    Box::pin(recorder.cleanup(&name)).await;
+                    Err(RecordError::Deadline {
+                        name,
+                        deadline: RECORD_DEADLINE,
+                    })
+                },
             };
             match outcome {
                 Ok(written) => {
@@ -336,6 +343,7 @@ impl Recorder {
             }
         });
         let mut guard = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.retain(|task| !task.is_finished());
         guard.push(handle);
     }
 
