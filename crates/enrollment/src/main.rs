@@ -97,11 +97,6 @@ fn version_requested() -> bool {
     std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V")
 }
 
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the main async block holds many startup locals across the server await; the drain \
-              variable is the only addition, kept off the hot path"
-)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if version_requested() {
