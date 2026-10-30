@@ -97,6 +97,11 @@ fn version_requested() -> bool {
     std::env::args().skip(1).any(|arg| arg == "--version" || arg == "-V")
 }
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the main async block holds many startup locals across the server await; the drain \
+              variable is the only addition, kept off the hot path"
+)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if version_requested() {
@@ -194,11 +199,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = Handle::new();
     tokio::spawn(shutdown_signal(handle.clone()));
 
+    #[cfg(feature = "csr-record")]
+    let record_drain = state.recorder.clone();
+
     let addr: SocketAddr = listen.parse()?;
     tracing::info!(%addr, "enrollment service listening over https");
     // The acceptor hands each connection's verified client leaf to the renewal handler.
     let server = axum_server::bind(addr).acceptor(PeerAcceptor(TlsAcceptor::new(tls)));
     Box::pin(server.handle(handle).serve(router(state).into_make_service())).await?;
+
+    #[cfg(feature = "csr-record")]
+    Box::pin(drain_records(record_drain)).await;
     Ok(())
 }
 
@@ -504,6 +515,15 @@ async fn load_recorder(authorizer: &Authorizer) -> Result<Option<Arc<enrollment:
         "enrollments recorded as CertificateSigningRequests"
     );
     Ok(Some(Arc::new(recorder)))
+}
+
+/// Wait for outstanding recording tasks so a shutdown between CSR calls does
+/// not leave a partial record on the hub.
+#[cfg(feature = "csr-record")]
+async fn drain_records(recorder: Option<Arc<enrollment::record::Recorder>>) {
+    if let Some(recorder) = &recorder {
+        recorder.drain().await;
+    }
 }
 
 /// Say at startup which rights a record would lack, so a missing role shows

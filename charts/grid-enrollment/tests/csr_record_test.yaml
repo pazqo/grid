@@ -19,7 +19,7 @@ tests:
           value:
             - apiGroups: ["certificates.k8s.io"]
               resources: ["certificatesigningrequests"]
-              verbs: ["create"]
+              verbs: ["create", "delete"]
             - apiGroups: ["certificates.k8s.io"]
               resources: ["certificatesigningrequests/status"]
               verbs: ["patch"]

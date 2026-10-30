@@ -18,7 +18,7 @@ use k8s_openapi::{
         certificates::v1::{CertificateSigningRequest, CertificateSigningRequestSpec},
     },
 };
-use kube::api::{Api, ObjectMeta, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams, PostParams};
 use uuid::Uuid;
 
 /// The signer name enrollments are recorded under when none is configured.
@@ -45,8 +45,14 @@ const CSR_PEM_LABEL: &str = "CERTIFICATE REQUEST";
 /// The PEM labels a request may arrive under.
 const REQUEST_LABELS: [&str; 2] = [CSR_PEM_LABEL, "NEW CERTIFICATE REQUEST"];
 
-/// How long one record may take, all three calls included.
+/// How long one record may take, all calls and retries included.
 const RECORD_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How many times to retry the completion call before cleaning up.
+const COMPLETION_RETRIES: u32 = 2;
+
+/// Pause between completion retries, short enough to fit the deadline.
+const RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// One enrollment to record.
 #[derive(Clone, Debug)]
@@ -126,7 +132,8 @@ impl RecordError {
     }
 }
 
-/// Writes enrollment records to the API server.
+/// Writes enrollment records to the API server and tracks outstanding tasks
+/// so the shutdown drain can wait for them.
 pub struct Recorder {
     /// The cluster-scoped requests API.
     requests: Api<CertificateSigningRequest>,
@@ -134,6 +141,8 @@ pub struct Recorder {
     reviews: Api<SelfSubjectAccessReview>,
     /// The signer name records are filed under.
     signer_name: String,
+    /// Outstanding recording tasks the shutdown drain joins.
+    handles: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for Recorder {
@@ -152,6 +161,7 @@ impl Recorder {
             requests: Api::all(client.clone()),
             reviews: Api::all(client),
             signer_name,
+            handles: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -172,6 +182,7 @@ impl Recorder {
     pub async fn missing_access(&self) -> Result<Vec<String>, kube::Error> {
         let needed = [
             ("create", "certificatesigningrequests", None, None),
+            ("delete", "certificatesigningrequests", None, None),
             ("patch", "certificatesigningrequests", Some("approval"), None),
             ("patch", "certificatesigningrequests", Some("status"), None),
             ("approve", "signers", None, Some(self.signer_name.as_str())),
@@ -216,17 +227,34 @@ impl Recorder {
     /// Create the request, approve it, and complete it with the issued certificate.
     /// Returns the record's name.
     ///
+    /// Completion is retried on failure. If retries are exhausted, the
+    /// approved-but-incomplete record is deleted so it does not linger on
+    /// clusters whose CSR cleaner does not collect that state.
+    ///
     /// # Errors
     ///
-    /// Returns which call failed. A partial record, created but not approved or
-    /// completed, is left for the operator to read and the API server to collect.
+    /// Returns which call failed. A record that could not be completed is
+    /// cleaned up; a record that could not be created or approved is left for
+    /// the API server's pending-CSR cleaner.
     pub async fn record(&self, record: &Record) -> Result<String, RecordError> {
         let name = record_name(&record.site, record.enrollment_id);
         // Boxed: each kube call builds a large future, kept off this frame.
         Box::pin(self.create(&name, record)).await?;
         Box::pin(self.approve(&name)).await?;
-        Box::pin(self.complete(&name, &record.cert_pem)).await?;
-        Ok(name)
+
+        let mut result = Box::pin(self.complete(&name, &record.cert_pem)).await;
+        for _ in 0..COMPLETION_RETRIES {
+            if result.is_ok() {
+                break;
+            }
+            tokio::time::sleep(RETRY_DELAY).await;
+            result = Box::pin(self.complete(&name, &record.cert_pem)).await;
+        }
+
+        if result.is_err() {
+            Box::pin(self.cleanup(&name)).await;
+        }
+        result.map(|()| name)
     }
 
     /// Create the request. A name already taken is refused, not adopted: nothing
@@ -272,27 +300,62 @@ impl Recorder {
                 source,
             })
     }
-}
 
-/// Write `record` off the request path, within the deadline, and log the outcome.
-pub fn spawn(recorder: Arc<Recorder>, record: Record) {
-    tokio::spawn(async move {
-        let outcome = match tokio::time::timeout(RECORD_DEADLINE, recorder.record(&record)).await {
-            Ok(outcome) => outcome,
-            Err(_elapsed) => Err(RecordError::Deadline {
-                name: record_name(&record.site, record.enrollment_id),
-                deadline: RECORD_DEADLINE,
-            }),
-        };
-        match outcome {
-            Ok(written) => {
-                tracing::info!(enrollment_id = %record.enrollment_id, record = %written, "enrollment recorded");
+    /// Delete an approved-but-incomplete record so it does not linger on
+    /// clusters whose CSR cleaner does not collect that state.
+    async fn cleanup(&self, name: &str) {
+        match self.requests.delete(name, &DeleteParams::default()).await {
+            Ok(_deleted) => {
+                tracing::info!(record = %name, "deleted incomplete record");
             },
             Err(error) => {
-                tracing::error!(enrollment_id = %record.enrollment_id, error = %error.summary(), "enrollment not recorded");
+                tracing::warn!(record = %name, %error, "could not delete the incomplete record");
             },
         }
-    });
+    }
+
+    /// Write `record` off the request path, within the deadline, and log the
+    /// outcome. The task is tracked so [`drain`](Self::drain) can wait for it.
+    pub fn spawn(self: &Arc<Self>, record: Record) {
+        let recorder = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            let outcome = match tokio::time::timeout(RECORD_DEADLINE, recorder.record(&record)).await {
+                Ok(outcome) => outcome,
+                Err(_elapsed) => Err(RecordError::Deadline {
+                    name: record_name(&record.site, record.enrollment_id),
+                    deadline: RECORD_DEADLINE,
+                }),
+            };
+            match outcome {
+                Ok(written) => {
+                    tracing::info!(enrollment_id = %record.enrollment_id, record = %written, "enrollment recorded");
+                },
+                Err(error) => {
+                    tracing::error!(enrollment_id = %record.enrollment_id, error = %error.summary(), "enrollment not recorded");
+                },
+            }
+        });
+        let mut guard = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.push(handle);
+    }
+
+    /// Wait for every outstanding recording task to finish.
+    ///
+    /// Called once after the server stops accepting requests, so no new tasks
+    /// are spawned while draining.
+    pub async fn drain(&self) {
+        let handles = {
+            let mut guard = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *guard)
+        };
+        if handles.is_empty() {
+            return;
+        }
+        tracing::info!(outstanding = handles.len(), "waiting for recording tasks");
+        for handle in handles {
+            drop(handle.await);
+        }
+    }
 }
 
 /// The field manager on every patch.
@@ -379,8 +442,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        APPROVED_REASON, DEFAULT_SIGNER_NAME, Record, RecordError, Recorder, SITE_LABEL, approval_patch, build,
-        canonical_request, certificate_patch, record_name,
+        APPROVED_REASON, COMPLETION_RETRIES, DEFAULT_SIGNER_NAME, Record, RecordError, Recorder, SITE_LABEL,
+        approval_patch, build, canonical_request, certificate_patch, record_name,
     };
 
     const ID: Uuid = Uuid::from_u128(0x9F86_D081_884C_7D65_9A2F_EAA0_C55A_D015);
@@ -518,6 +581,7 @@ mod tests {
     const CREATED: &str = r#"{"apiVersion":"certificates.k8s.io/v1","kind":"CertificateSigningRequest","metadata":{"name":"x"},"spec":{"request":"","signerName":"s"}}"#;
     const CONFLICT: &str = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"exists","reason":"AlreadyExists","code":409}"#;
     const DENIED: &str = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"forbidden","reason":"Forbidden","code":403}"#;
+    const SERVER_ERROR: &str = r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"server error","reason":"ServerTimeout","code":500}"#;
 
     fn record() -> Record {
         Record {
@@ -592,5 +656,51 @@ mod tests {
             matches!(&error, RecordError::Approve { name, .. } if name.starts_with("west-")),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn completion_is_retried_on_transient_failure() {
+        let (client, seen) = fake_server(|_method, path, count| {
+            if path.ends_with("/status") && count == 3 {
+                (500, SERVER_ERROR)
+            } else {
+                (200, CREATED)
+            }
+        });
+        let recorder = Recorder::new(client, DEFAULT_SIGNER_NAME.to_owned());
+        let name = recorder.record(&record()).await.expect("retried completion succeeds");
+        let calls: Vec<Seen> = seen.lock().expect("log").clone();
+        assert_eq!(calls.len(), 4, "create + approve + failed complete + retried complete");
+        assert!(calls[2].1.ends_with("/status"), "third call is the first completion");
+        assert!(calls[3].1.ends_with("/status"), "fourth call is the retried completion");
+        assert_eq!(name, record_name("west", ID));
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_record_is_deleted_when_completion_fails() {
+        let (client, seen) = fake_server(|_method, path, _count| {
+            if path.ends_with("/status") {
+                (500, SERVER_ERROR)
+            } else {
+                (200, CREATED)
+            }
+        });
+        let recorder = Recorder::new(client, DEFAULT_SIGNER_NAME.to_owned());
+        let error = recorder.record(&record()).await.expect_err("completion always fails");
+        assert!(matches!(&error, RecordError::Complete { .. }), "{error}");
+        let calls: Vec<Seen> = seen.lock().expect("log").clone();
+        let expected = 1 + 1 + (1 + usize::try_from(COMPLETION_RETRIES).expect("fits")) + 1;
+        assert_eq!(calls.len(), expected, "create + approve + attempts + delete");
+        assert_eq!(calls[expected - 1].0, "DELETE", "the incomplete record is deleted");
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_outstanding_tasks() {
+        let (client, seen) = fake_server(|_method, _path, _count| (200, CREATED));
+        let recorder = Arc::new(Recorder::new(client, DEFAULT_SIGNER_NAME.to_owned()));
+        recorder.spawn(record());
+        recorder.drain().await;
+        let len = seen.lock().expect("log").len();
+        assert_eq!(len, 3, "the task ran to completion before drain returned");
     }
 }
