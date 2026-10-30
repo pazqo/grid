@@ -473,7 +473,7 @@ type GridNetworkBudgetPolicy struct {
 
 // GatewayCASecretRef Optional gateway-namespace Secret supplying a custom CA bundle for tls transport. Specify only its name and optional key; the Secret must be in the namespace named by the containing GatewayRef. The mounted path is /run/secrets/grid-backend-ca/{secret-name}/{key}; the key defaults to ca.crt. Omitted uses the process trust store.
 type GatewayCASecretRef struct {
-	// Optional key containing the CA bundle. Defaults to ca.crt.
+	// Optional key containing the CA bundle. Defaults to ca.crt. A Secret key: no /, not . or .., and not starting with ...
 	Key *string `json:"key,omitempty"`
 	// Secret name in the target gateway namespace.
 	Name string `json:"name"`
@@ -504,9 +504,9 @@ type GridNetworkConsumerGatewaysItemPraxisConfigClusterEndpointsItem struct {
 	Transport *EndpointTransport `json:"transport,omitempty"`
 }
 
-// GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology Derive the endpoint topology from the declarations of named providers, instead of requiring a clusterEndpoints entry per candidate.
+// GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology Settings for the endpoint topology the operator derives for each candidate with no clusterEndpoints entry. Absent still derives.
 type GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology struct {
-	// Routing identities whose declarations this gateway derives from.
+	// Remote routing identities this gateway derives a hop for without a member catalog, as under SWIM membership.
 	// Each entry is a provider's clusterName, or its metadata.name when that is unset. At most 64 entries, each named once.
 	FromProviders []string `json:"fromProviders,omitempty"`
 	// TLS for derived local https backends. Omitted uses the endpoint host and the process trust store.
@@ -561,7 +561,7 @@ type GridNetworkConsumerGatewaysItemPraxisConfig struct {
 	// In projected-credential mode, mount each Secret at {credentialMountPath}/{secret-namespace}/{secret-name} with its data keys as files. Static file: entries continue to use their explicit paths and are not constrained by this directory layout.
 	// Default: /run/secrets/grid-credentials.
 	CredentialMountPath string `json:"credentialMountPath,omitempty"`
-	// Derive the endpoint topology from the declarations of named providers, instead of requiring a clusterEndpoints entry per candidate.
+	// Settings for the endpoint topology the operator derives for each candidate with no clusterEndpoints entry. Absent still derives.
 	DeriveTopology *GridNetworkConsumerGatewaysItemPraxisConfigDeriveTopology `json:"deriveTopology,omitempty"`
 	// Generate the dynamic credential_inject filter and projected mount root, including when the current overlay has no credentials. Enable this first, then roll out the generated config before asserting readiness with supportsProjectedCredentials.
 	// Default: false.
@@ -609,6 +609,9 @@ type GridNetworkConsumerGatewaysItemProviderHopEndpointsItem struct {
 
 // GridNetworkConsumerGatewaysItem Reference to a Praxis Gateway that participates in this grid.
 type GridNetworkConsumerGatewaysItem struct {
+	// Model-discovery contract version supported by the running gateway.
+	// Set this only after the gateway is running an image that understands the expires_at routing-candidate field and enforces its deadline. The operator includes discovered model candidates only when this is exactly v1; absent or other values keep dynamic candidates withheld.
+	ModelDiscoveryContractVersion *string `json:"modelDiscoveryContractVersion,omitempty"`
 	// Gateway name.
 	Name string `json:"name"`
 	// Gateway namespace.
@@ -713,7 +716,7 @@ type GridNetworkSpec struct {
 	BudgetPolicy *GridNetworkBudgetPolicy `json:"budgetPolicy,omitempty"`
 	// References to Praxis Gateways that participate in this grid.
 	ConsumerGateways []GridNetworkConsumerGatewaysItem `json:"consumerGateways,omitempty"`
-	// The grid this network belongs to, set once by bootstrap or its delivery automation. The operator waits until this is declared and never generates a grid ID. Moving to another grid means recreating the network.
+	// The grid this network belongs to, set once by bootstrap or its delivery automation. The operator waits until this is declared and never generates a grid ID. A grid ID that operators before #474 kept only in status is copied here once, and status then mirrors spec. Moving to another grid means recreating the network.
 	GridID string `json:"gridId,omitempty"`
 	// Grid-wide membership source. When absent, the install's startup setting applies. A change causes the operator to restart gracefully into the declared mode.
 	Membership *GridNetworkMembership `json:"membership,omitempty"`
@@ -1123,7 +1126,7 @@ type OpenAIModelsSource struct {
 }
 
 // ModelDiscoveryConfig Where to discover the models this provider serves.
-// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Until route and provider-record formats support inventory expiry, discovered names are withheld and do not fall back to spec.models. When absent, no discovery runs. Exactly one source field must be set (CRD oneOf).
+// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Discovered names may be routed locally to gateways that declare model-discovery contract v1. They are withheld from provider records, whose current wire format cannot carry expiry, and never fall back to spec.models. When absent, no discovery runs. Exactly one source field must be set (CRD oneOf).
 type ModelDiscoveryConfig struct {
 	// OpenAI-compatible GET /v1/models (vLLM, KServe, OpenAI).
 	// Reads data[].id from the response. The response is rejected as a whole when it is not valid JSON, has a blank, overlong, or duplicate id, or lists more models than the operator's cap. A rejected response never clears the previously discovered set.
@@ -1176,7 +1179,7 @@ type InferenceProviderSpec struct {
 	// [GridNetwork]: crate::crd::grid_network::GridNetwork
 	MetricsConfig *MetricsConfig `json:"metricsConfig,omitempty"`
 	// Where to discover the models this provider serves.
-	// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Until route and provider-record formats support inventory expiry, discovered names are withheld and do not fall back to spec.models. When absent, no discovery runs.
+	// When set, the operator polls the backend on a fixed cadence and holds the served-model set in memory, expiring it when polls stop succeeding. Discovered names may be routed locally to gateways that declare model-discovery contract v1. They are withheld from provider records, whose current wire format cannot carry expiry, and never fall back to spec.models. When absent, no discovery runs.
 	ModelDiscovery *ModelDiscoveryConfig `json:"modelDiscovery,omitempty"`
 	// Models served by this provider.
 	Models []ModelInfo `json:"models,omitempty"`
